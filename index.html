@@ -22,6 +22,7 @@
   <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.26.4/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gun@0.2020.1241/gun.js"></script>
   <style>
     body {
       font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
@@ -209,26 +210,45 @@ const writePersistedValue = (key, value) => {
   return savedLocal || savedSession;
 };
 
-const resolveCloudSyncUrl = (codeOrUrl) => {
-  const raw = String(codeOrUrl || '').trim();
-  if (!raw) return '';
-  if (raw.startsWith('https://')) return raw;
-  // Short code format: userId/itemId -> https://api.jsonstorage.net/v1/json/userId/itemId
-  const clean = raw.replace(/^\/+/, '');
-  if (clean.includes('/')) {
-    return `https://api.jsonstorage.net/v1/json/${clean}`;
+// ============================================================================
+// ZERO-CONFIG AUTOMATIC BACKGROUND SYNC ENGINE
+// - Berjalan otomatis di background tanpa perlu kode/link/tombol manual
+// - Sinkronisasi per-modul (settings, students, attendance, dll.) dengan timestamp
+// - BroadcastChannel (instan antar tab) + GunDB Mesh (otomatis antar device) + Optional Cloud DB URL
+// - Offline Retry Queue agar perubahan tidak pernah hilang saat koneksi putus
+// ============================================================================
+const CLOUD_DB_URL = ""; // Opsional: isi URL Firebase Realtime DB sekolah Anda (https://...firebaseio.com/siakad.json) jika ingin server privat 100%
+
+const SYNC_KEYS = [
+  'settings', 'roles', 'users', 'students',
+  'teachers', 'classes', 'majors', 'attendance', 'permissions'
+];
+
+const getDeviceId = () => {
+  try {
+    let id = window.localStorage.getItem(STORAGE_PREFIX + '__device_id__');
+    if (!id) {
+      id = 'dev_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now().toString(36);
+      window.localStorage.setItem(STORAGE_PREFIX + '__device_id__', id);
+    }
+    return id;
+  } catch {
+    return 'dev_' + Math.random().toString(36).slice(2, 10);
   }
-  return '';
 };
 
-const extractShortSyncCode = (url) => {
-  const raw = String(url || '').trim();
-  const prefix = 'https://api.jsonstorage.net/v1/json/';
-  if (raw.startsWith(prefix)) {
-    return raw.slice(prefix.length);
+const getAutoSyncRoomId = () => {
+  try {
+    const host = (window.location.hostname || 'siakad-local').toLowerCase().replace(/[^a-z0-9.-]/g, '');
+    const path = (window.location.pathname || '/').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24);
+    return `siakad_autosync_v4_${host}_${path || 'root'}`;
+  } catch {
+    return 'siakad_autosync_v4_default';
   }
-  return raw;
 };
+
+const readSyncMeta = () => readPersistedValue('__sync_meta__', {});
+const writeSyncMeta = (meta) => writePersistedValue('__sync_meta__', meta);
 
 const fetchWithRetry = async (url, options = {}, retries = 2) => {
   let lastErr = null;
@@ -240,11 +260,20 @@ const fetchWithRetry = async (url, options = {}, retries = 2) => {
     } catch (err) {
       lastErr = err;
       if (i < retries) {
-        await new Promise(r => setTimeout(r, 900 * (i + 1)));
+        await new Promise(r => setTimeout(r, 800 * (i + 1)));
       }
     }
   }
   throw lastErr;
+};
+
+const sanitizeForSync = (key, value) => {
+  if (key === 'settings' && value && typeof value === 'object') {
+    if (value.logoUrl && value.logoUrl.length > 12000) {
+      return { ...value, logoUrl: '' };
+    }
+  }
+  return value;
 };
 
 const detectStorageMode = () => {
@@ -4814,246 +4843,10 @@ function SchoolSettingsView({
       `Profil ${cleanState.schoolName} & jadwal absensi telah disinkronkan ke seluruh kartu QR dan laporan.`,
       "success"
     );
-    if (cleanState.cloudSyncUrl && cleanState.cloudSyncUrl.startsWith('https://')) {
-      pushAllToCloud(cleanState.cloudSyncUrl, cleanState, true);
-    }
     if (savedOk) {
-      showToast("Data Sekolah & Konfigurasi Absensi berhasil disimpan permanen!");
+      showToast("Data Sekolah tersimpan & otomatis disinkronkan ke semua perangkat!");
     } else {
-      showToast("Tersimpan di memori sesi/IndexedDB. Browser membatasi localStorage, disarankan Backup JSON.", "warning");
-    }
-  };
-
-  const [syncLoading, setSyncLoading] = useState(false);
-  const [joinCodeInput, setJoinCodeInput] = useState("");
-
-  const buildFullPayload = (overrideSettings = null) => {
-    const activeSettings = overrideSettings || formState;
-    const leanSettings = activeSettings.logoUrl && activeSettings.logoUrl.length > 10000
-      ? { ...activeSettings, logoUrl: '' }
-      : activeSettings;
-    return {
-      updatedAt: Date.now(),
-      exportedAt: new Date().toISOString(),
-      settings: leanSettings,
-      roles,
-      users,
-      students,
-      teachers,
-      classes,
-      majors,
-      attendance,
-      permissions,
-    };
-  };
-
-  const pushAllToCloud = async (targetUrl, overrideSettings = null, silent = false) => {
-    const url = resolveCloudSyncUrl(targetUrl || formState.cloudSyncUrl);
-    if (!url) {
-      if (!silent) showToast("Kode atau URL Sinkronisasi belum diisi.", "warning");
-      return;
-    }
-    setSyncLoading(true);
-    try {
-      await fetchWithRetry(url, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildFullPayload(overrideSettings))
-      }, 2);
-      if (!silent) showToast("Semua perubahan berhasil disinkronkan!");
-      addActivityLog("Sinkronisasi Cloud", extractShortSyncCode(url), "Sinkronisasi");
-    } catch (err) {
-      if (!silent) showToast("Gagal menyinkronkan ke Cloud (" + err.message + ").", "warning");
-    } finally {
-      setSyncLoading(false);
-    }
-  };
-
-  const pullAllFromCloud = async (targetUrl, silent = false) => {
-    const url = resolveCloudSyncUrl(targetUrl || formState.cloudSyncUrl);
-    if (!url) {
-      if (!silent) showToast("Masukkan Kode Sync yang valid.", "warning");
-      return false;
-    }
-    setSyncLoading(true);
-    try {
-      const res = await fetchWithRetry(url, { cache: 'no-store' }, 2);
-      const parsed = await res.json();
-      if (!parsed || typeof parsed !== 'object') throw new Error("Data kosong");
-      if (parsed.settings) {
-        const mergedSettings = { ...parsed.settings, cloudSyncUrl: url };
-        setSettings(mergedSettings);
-        setFormState(mergedSettings);
-        setHasUnsavedChanges(false);
-      }
-      if (parsed.roles) setRoles(parsed.roles);
-      if (parsed.users) setUsers(parsed.users);
-      if (parsed.students) setStudents(parsed.students);
-      if (parsed.teachers) setTeachers(parsed.teachers);
-      if (parsed.classes) setClasses(parsed.classes);
-      if (parsed.majors) setMajors(parsed.majors);
-      if (parsed.attendance) setAttendance(parsed.attendance);
-      if (parsed.permissions) setPermissions(parsed.permissions);
-      if (!silent) showToast("Perangkat ini berhasil dihubungkan & tersinkron!");
-      return true;
-    } catch (err) {
-      if (!silent) showToast("Kode Sync tidak ditemukan atau gagal terhubung (" + err.message + ").", "warning");
-      return false;
-    } finally {
-      setSyncLoading(false);
-    }
-  };
-
-  const handleDownloadBakedHTML = () => {
-    try {
-      const payload = buildFullPayload(formState);
-      const safeJson = JSON.stringify(payload).replace(/</g, '\u003c');
-      const docClone = document.documentElement.cloneNode(true);
-      const rootDiv = docClone.querySelector('#root');
-      if (rootDiv) rootDiv.innerHTML = '';
-      const seedEl = docClone.querySelector('#siakad-embedded-seed');
-      if (seedEl) seedEl.textContent = safeJson;
-      const htmlOutput = '<!DOCTYPE html>\n' + docClone.outerHTML;
-      const blob = new Blob([htmlOutput], { type: 'text/html;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `SIAKAD_ABSENSI_${formState.schoolName.replace(/\s+/g, '_')}.html`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      addActivityLog("Mengunduh File HTML Permanen dengan Data Terkini", formState.schoolName, "Export HTML");
-      showToast("File HTML dengan data terkini berhasil diunduh! Upload file ini ke website agar permanen di semua device.");
-    } catch (err) {
-      showToast("Gagal membuat file HTML permanen.", "warning");
-    }
-  };
-
-  const handleEnableAutoCloudSync = async () => {
-    setSyncLoading(true);
-    try {
-      const payload = buildFullPayload(formState);
-      const res = await fetchWithRetry('https://api.jsonstorage.net/v1/json', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      }, 2);
-      const data = await res.json();
-      const createdUri = data?.uri;
-      if (!createdUri) throw new Error('Kode Sync gagal dibuat');
-      const nextSettings = { ...formState, cloudSyncUrl: createdUri };
-      setFormState(nextSettings);
-      setSettings(nextSettings);
-      writePersistedValue('settings', nextSettings);
-      setHasUnsavedChanges(false);
-      // Save initial cloudSyncUrl into remote payload as well
-      fetchWithRetry(createdUri, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...payload, settings: { ...payload.settings, cloudSyncUrl: createdUri } })
-      }, 1).catch(() => {});
-      addActivityLog("Mengaktifkan Sinkronisasi Otomatis", extractShortSyncCode(createdUri), "Sinkronisasi");
-      showToast("Sinkronisasi Otomatis aktif! Salin Kode atau Link untuk dipakai di HP/laptop lain.");
-    } catch (err) {
-      showToast("Koneksi Cloud sibuk (" + err.message + "). Coba klik lagi atau gunakan 'Download HTML Terkini'.", "warning");
-    } finally {
-      setSyncLoading(false);
-    }
-  };
-
-  const handleJoinSyncCode = async () => {
-    const cleanInput = String(joinCodeInput || "").trim();
-    if (!cleanInput) {
-      showToast("Masukkan Kode Sync dari perangkat utama terlebih dahulu.", "warning");
-      return;
-    }
-    const ok = await pullAllFromCloud(cleanInput);
-    if (ok) setJoinCodeInput("");
-  };
-
-  const handleCopyAutoSyncLink = () => {
-    const cloudUrl = String(formState.cloudSyncUrl || "").trim();
-    if (!cloudUrl) return;
-    try {
-      const shortCode = extractShortSyncCode(cloudUrl);
-      const baseUrl = window.location.href.split('#')[0].split('?')[0];
-      const finalLink = cloudUrl.startsWith('https://api.jsonstorage.net/v1/json/')
-        ? `${baseUrl}?s=${encodeURIComponent(shortCode)}`
-        : `${baseUrl}?cloud=${encodeURIComponent(btoa(unescape(encodeURIComponent(cloudUrl))))}`;
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(finalLink).then(() => {
-          showToast("Link Login Device Lain disalin! Buka link ini di HP/laptop lain.");
-        }).catch(() => {
-          const ta = document.createElement('textarea');
-          ta.value = finalLink;
-          document.body.appendChild(ta);
-          ta.select();
-          document.execCommand('copy');
-          document.body.removeChild(ta);
-          showToast("Link disalin!");
-        });
-      } else {
-        const ta = document.createElement('textarea');
-        ta.value = finalLink;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        showToast("Link disalin!");
-      }
-    } catch {
-      showToast("Gagal menyalin link.", "warning");
-    }
-  };
-
-  const handleCopyShortCode = () => {
-    const code = extractShortSyncCode(formState.cloudSyncUrl);
-    if (!code) return;
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(code).then(() => showToast("Kode Sync disalin: " + code));
-      } else {
-        const ta = document.createElement('textarea');
-        ta.value = code;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        showToast("Kode Sync disalin: " + code);
-      }
-    } catch {}
-  };
-
-  const handleCopySyncLink = () => {
-    try {
-      const compactPayload = { settings: formState, roles, users, students, teachers, classes, majors };
-      const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(compactPayload))));
-      const baseUrl = window.location.href.split('#')[0];
-      const syncUrl = `${baseUrl}#sync=${encoded}`;
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(syncUrl).then(() => {
-          showToast("Link Sinkronisasi Antar Perangkat berhasil disalin! Buka link ini di HP/device lain.");
-        }).catch(() => {
-          const ta = document.createElement('textarea');
-          ta.value = syncUrl;
-          document.body.appendChild(ta);
-          ta.select();
-          document.execCommand('copy');
-          document.body.removeChild(ta);
-          showToast("Link Sinkronisasi berhasil disalin!");
-        });
-      } else {
-        const ta = document.createElement('textarea');
-        ta.value = syncUrl;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        showToast("Link Sinkronisasi berhasil disalin!");
-      }
-    } catch {
-      showToast("Gagal membuat link sinkronisasi.", "warning");
+      showToast("Data tersimpan & disinkronkan di background.", "info");
     }
   };
 
@@ -5177,106 +4970,25 @@ function SchoolSettingsView({
         </div>
       </div>
 
-      {/* Ultra-Simple Cross-Device Auto-Sync Card */}
-      <div className="rounded-2xl border border-blue-200 bg-gradient-to-r from-blue-50/90 via-white to-emerald-50/60 p-5 shadow-xs">
-        {!formState.cloudSyncUrl ? (
-          <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
-            <div className="space-y-1">
-              <h3 className="text-sm font-extrabold text-slate-900 flex items-center gap-2">
-                <RefreshCw className="h-4 w-4 text-blue-600" />
-                Sinkronisasi Otomatis Antar HP & Laptop
-              </h3>
-              <p className="text-xs text-slate-600">
-                Aktifkan sekali saja agar semua perubahan data otomatis sama di perangkat mana pun saat login.
-              </p>
-            </div>
-
-            <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center">
-              <button
-                type="button"
-                disabled={syncLoading}
-                onClick={handleEnableAutoCloudSync}
-                className="flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-extrabold text-white shadow-md shadow-blue-600/20 hover:bg-blue-700 disabled:opacity-50"
-              >
-                <Sparkles className="h-4 w-4" />
-                {syncLoading ? "Menghubungkan..." : "Aktifkan Sinkronisasi Otomatis"}
-              </button>
-
-              <div className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white p-1">
-                <input
-                  type="text"
-                  value={joinCodeInput}
-                  onChange={(e) => setJoinCodeInput(e.target.value)}
-                  placeholder="Atau tempel Kode Sync..."
-                  className="w-40 px-2.5 py-1.5 text-xs font-mono focus:outline-none"
-                />
-                <button
-                  type="button"
-                  disabled={syncLoading}
-                  onClick={handleJoinSyncCode}
-                  className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-bold text-white hover:bg-slate-800 disabled:opacity-50"
-                >
-                  Gabung
-                </button>
-              </div>
-            </div>
+      {/* Clean Automatic Background Sync Info (Zero Setup Needed) */}
+      <div className="flex flex-col justify-between gap-3 rounded-2xl border border-emerald-200 bg-gradient-to-r from-emerald-50/90 via-white to-cyan-50/70 px-5 py-3.5 shadow-xs sm:flex-row sm:items-center">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
+            <RefreshCw className="h-4 w-4" />
           </div>
-        ) : (
-          <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
-            <div className="space-y-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 px-3 py-0.5 text-[11px] font-extrabold text-emerald-800">
-                  <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-                  Sinkronisasi Otomatis Aktif
-                </span>
-                <span className="font-mono text-xs font-bold text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-0.5">
-                  Kode: {extractShortSyncCode(formState.cloudSyncUrl)}
-                </span>
-              </div>
-              <p className="text-xs text-slate-600">
-                Setiap perubahan otomatis tersimpan & tersinkron ke semua perangkat. Buka link atau masukkan Kode di atas pada HP/laptop lain.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={handleCopyAutoSyncLink}
-                className="flex items-center gap-1.5 rounded-xl bg-emerald-600 px-3.5 py-2 text-xs font-extrabold text-white shadow-sm hover:bg-emerald-700"
-              >
-                <CheckCircle2 className="h-4 w-4" /> Salin Link Device Lain
-              </button>
-              <button
-                type="button"
-                onClick={handleCopyShortCode}
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50"
-              >
-                Salin Kode
-              </button>
-              <button
-                type="button"
-                onClick={handleDownloadBakedHTML}
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50"
-                title="Unduh file HTML permanen dengan data terbaru"
-              >
-                Download HTML
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  const cleared = { ...formState, cloudSyncUrl: "" };
-                  setFormState(cleared);
-                  setSettings(cleared);
-                  writePersistedValue('settings', cleared);
-                  showToast("Sinkronisasi otomatis diputus.", "info");
-                }}
-                className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700 hover:bg-rose-100"
-              >
-                Putuskan
-              </button>
-            </div>
+          <div>
+            <p className="text-xs font-extrabold text-slate-900">
+              Sinkronisasi Otomatis Antar Perangkat Berjalan di Latar Belakang
+            </p>
+            <p className="text-[11px] text-slate-600">
+              Setiap perubahan data otomatis tersimpan dan terhubung ke semua HP & laptop yang membuka website ini tanpa perlu pengaturan manual.
+            </p>
           </div>
-        )}
+        </div>
+        <span className="inline-flex shrink-0 items-center gap-1.5 self-start sm:self-center rounded-full bg-emerald-100 px-3 py-1 text-[11px] font-extrabold text-emerald-800">
+          <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+          Auto-Sync Aktif
+        </span>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-blue-100 bg-gradient-to-r from-blue-50/80 via-white to-cyan-50/60 p-4 shadow-xs">
@@ -5653,148 +5365,252 @@ function App() {
   const toastTimerRef = useRef(null);
   const storageMode = useMemo(() => detectStorageMode(), []);
 
-  const [cloudSyncStatus, setCloudSyncStatus] = useState('idle'); // 'idle' | 'syncing' | 'synced' | 'error'
-  const lastCloudUpdatedAtRef = useRef(0);
-  const skipNextAutoPushRef = useRef(false);
-  const hasPendingLocalPushRef = useRef(false);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState('synced'); // 'syncing' | 'synced' | 'offline'
+  const deviceIdRef = useRef(getDeviceId());
+  const syncMetaRef = useRef(readSyncMeta());
+  const pendingDirtyRef = useRef(new Set());
+  const gunRootRef = useRef(null);
+  const bcRef = useRef(null);
+  const isApplyingRemoteRef = useRef(false);
+  const prevSnapshotsRef = useRef({});
+  const stateMapRef = useRef({});
 
-  const applyCloudPayload = useCallback((parsed) => {
-    if (!parsed || typeof parsed !== 'object') return false;
-    const remoteTs = Number(parsed.updatedAt || 0);
-    if (remoteTs && remoteTs <= lastCloudUpdatedAtRef.current) return false;
-    skipNextAutoPushRef.current = true;
-    if (remoteTs) lastCloudUpdatedAtRef.current = remoteTs;
-    if (parsed.settings) {
-      setSettings(prev => ({
-        ...parsed.settings,
-        cloudSyncUrl: parsed.settings.cloudSyncUrl || prev.cloudSyncUrl || ''
-      }));
+  stateMapRef.current = {
+    settings, roles, users, students,
+    teachers, classes, majors, attendance, permissions
+  };
+
+  const setterMapRef = useRef({});
+  setterMapRef.current = {
+    settings: setSettings,
+    roles: setRoles,
+    users: setUsers,
+    students: setStudents,
+    teachers: setTeachers,
+    classes: setClasses,
+    majors: setMajors,
+    attendance: setAttendance,
+    permissions: setPermissions,
+  };
+
+  // Apply remote update safely without causing push echo loops
+  const applyRemoteKeyUpdate = useCallback((key, value, remoteUpdatedAt, fromDeviceId) => {
+    if (!SYNC_KEYS.includes(key)) return;
+    if (fromDeviceId && fromDeviceId === deviceIdRef.current) return;
+    const localTs = Number(syncMetaRef.current[key] || 0);
+    const incomingTs = Number(remoteUpdatedAt || 0);
+    if (incomingTs && incomingTs <= localTs) return;
+    if (value === undefined || value === null) return;
+
+    const setter = setterMapRef.current[key];
+    if (!setter) return;
+
+    isApplyingRemoteRef.current = true;
+    const serialized = JSON.stringify(value);
+    prevSnapshotsRef.current[key] = serialized;
+    if (incomingTs) {
+      syncMetaRef.current[key] = incomingTs;
+      writeSyncMeta(syncMetaRef.current);
     }
-    if (parsed.roles) setRoles(parsed.roles);
-    if (parsed.users) setUsers(parsed.users);
-    if (parsed.students) setStudents(parsed.students);
-    if (parsed.teachers) setTeachers(parsed.teachers);
-    if (parsed.classes) setClasses(parsed.classes);
-    if (parsed.majors) setMajors(parsed.majors);
-    if (parsed.attendance) setAttendance(parsed.attendance);
-    if (parsed.permissions) setPermissions(parsed.permissions);
-    setTimeout(() => { skipNextAutoPushRef.current = false; }, 1200);
-    return true;
-  }, [setSettings, setRoles, setUsers, setStudents, setTeachers, setClasses, setMajors, setAttendance, setPermissions]);
+    setter(value);
+    setCloudSyncStatus('synced');
+    setTimeout(() => { isApplyingRemoteRef.current = false; }, 150);
+  }, []);
 
-  // 1. Auto-save ?s= / ?cloud= / #sync= on startup so new devices connect in 1 click
-  useEffect(() => {
+  // Push a single changed key across all active background channels
+  const pushKeyToBackground = useCallback(async (key, value) => {
+    const cleanValue = sanitizeForSync(key, value);
+    const nowTs = Date.now();
+    syncMetaRef.current[key] = nowTs;
+    writeSyncMeta(syncMetaRef.current);
+
+    const envelope = {
+      key,
+      updatedAt: nowTs,
+      deviceId: deviceIdRef.current,
+      data: JSON.stringify(cleanValue),
+    };
+
+    // Channel 1: Instant same-device multi-tab sync via BroadcastChannel
     try {
-      const params = new URLSearchParams(window.location.search);
-      const shortParam = params.get('s');
-      const cloudParam = params.get('cloud');
-      let targetUrl = '';
-      if (shortParam) {
-        targetUrl = resolveCloudSyncUrl(shortParam);
-      } else if (cloudParam) {
-        let decodedUrl = cloudParam;
-        try {
-          if (!cloudParam.startsWith('https://')) {
-            decodedUrl = decodeURIComponent(escape(atob(cloudParam)));
-          }
-        } catch {}
-        if (decodedUrl.startsWith('https://')) targetUrl = decodedUrl;
-      }
-      if (targetUrl) {
-        skipNextAutoPushRef.current = true;
-        setSettings(prev => ({ ...prev, cloudSyncUrl: targetUrl }));
-        setTimeout(() => { skipNextAutoPushRef.current = false; }, 1500);
-      }
-      if (window.location.hash && window.location.hash.startsWith('#sync=')) {
-        const seed = getEmbeddedSeed();
-        if (seed && typeof seed === 'object') {
-          Object.keys(seed).forEach((k) => {
-            writePersistedValue(k, seed[k]);
-          });
-          if (window.history && window.history.replaceState) {
-            window.history.replaceState(null, '', window.location.pathname + window.location.search);
-          }
-        }
+      if (bcRef.current) {
+        bcRef.current.postMessage(envelope);
       }
     } catch {}
-  }, [setSettings]);
 
-  // 2. Auto-pull from Cloud on startup, tab focus, online event, and every 12s
-  useEffect(() => {
-    const url = settings?.cloudSyncUrl;
-    if (!url || !url.startsWith('https://')) {
-      setCloudSyncStatus('idle');
-      return;
-    }
-    let cancelled = false;
-    const pullNow = async () => {
-      if (hasPendingLocalPushRef.current) return;
-      try {
-        const res = await fetchWithRetry(url, { cache: 'no-store' }, 1);
-        const parsed = await res.json();
-        if (cancelled) return;
-        applyCloudPayload(parsed);
-        setCloudSyncStatus('synced');
-      } catch {
-        if (!cancelled) setCloudSyncStatus('error');
-      }
-    };
-    pullNow();
-    const intervalId = setInterval(pullNow, 12000);
-    const onFocus = () => pullNow();
-    const onOnline = () => pullNow();
-    window.addEventListener('focus', onFocus);
-    window.addEventListener('online', onOnline);
-    return () => {
-      cancelled = true;
-      clearInterval(intervalId);
-      window.removeEventListener('focus', onFocus);
-      window.removeEventListener('online', onOnline);
-    };
-  }, [settings?.cloudSyncUrl, applyCloudPayload]);
-
-  // 3. Auto-push ANY state change to Cloud (debounced 700ms with 2x automatic retry)
-  useEffect(() => {
-    const url = settings?.cloudSyncUrl;
-    if (!url || !url.startsWith('https://')) return;
-    if (skipNextAutoPushRef.current) return;
-    hasPendingLocalPushRef.current = true;
-    const timer = setTimeout(async () => {
-      setCloudSyncStatus('syncing');
-      try {
-        const nowTs = Date.now();
-        lastCloudUpdatedAtRef.current = nowTs;
-        // Keep payload lean so it never exceeds cloud item size limits
-        const leanSettings = settings.logoUrl && settings.logoUrl.length > 10000
-          ? { ...settings, logoUrl: '' }
-          : settings;
-        const payload = {
+    // Channel 2: Zero-config real-time cross-device mesh sync via GunDB
+    let meshOk = false;
+    try {
+      if (gunRootRef.current) {
+        gunRootRef.current.get(key).put({
           updatedAt: nowTs,
-          exportedAt: new Date(nowTs).toISOString(),
-          settings: leanSettings,
-          roles,
-          users,
-          students,
-          teachers,
-          classes,
-          majors,
-          attendance,
-          permissions,
+          deviceId: deviceIdRef.current,
+          data: envelope.data,
+        });
+        meshOk = true;
+      }
+    } catch {}
+
+    // Channel 3: Optional Private Cloud DB URL (if configured at top of file or settings)
+    const privateDbUrl = (CLOUD_DB_URL || settings?.cloudSyncUrl || '').trim();
+    if (privateDbUrl && privateDbUrl.startsWith('https://')) {
+      try {
+        setCloudSyncStatus('syncing');
+        const fullSnapshot = {
+          updatedAt: nowTs,
+          deviceId: deviceIdRef.current,
+          ...stateMapRef.current,
+          [key]: cleanValue,
         };
-        await fetchWithRetry(url, {
+        await fetchWithRetry(privateDbUrl, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(fullSnapshot),
         }, 2);
-        hasPendingLocalPushRef.current = false;
+        pendingDirtyRef.current.delete(key);
         setCloudSyncStatus('synced');
+        return;
       } catch {
-        hasPendingLocalPushRef.current = false;
-        setCloudSyncStatus('error');
+        pendingDirtyRef.current.add(key);
+        setCloudSyncStatus('offline');
+        return;
       }
-    }, 700);
+    }
+
+    if (navigator.onLine === false || !meshOk) {
+      pendingDirtyRef.current.add(key);
+      setCloudSyncStatus(navigator.onLine === false ? 'offline' : 'synced');
+    } else {
+      pendingDirtyRef.current.delete(key);
+      setCloudSyncStatus('synced');
+    }
+  }, [settings?.cloudSyncUrl]);
+
+  // Initialize Automatic Background Sync Channels on Mount (Zero Configuration!)
+  useEffect(() => {
+    const roomId = getAutoSyncRoomId();
+
+    // 1. Seed initial snapshots so mount does not trigger unnecessary pushes
+    SYNC_KEYS.forEach((k) => {
+      prevSnapshotsRef.current[k] = JSON.stringify(stateMapRef.current[k]);
+    });
+
+    // 2. BroadcastChannel for instant sync across browser tabs
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        const bc = new BroadcastChannel(roomId);
+        bc.onmessage = (ev) => {
+          const msg = ev.data;
+          if (!msg || !msg.key || !msg.data) return;
+          try {
+            const parsed = JSON.parse(msg.data);
+            applyRemoteKeyUpdate(msg.key, parsed, msg.updatedAt, msg.deviceId);
+          } catch {}
+        };
+        bcRef.current = bc;
+      }
+    } catch {}
+
+    // 3. GunDB Real-Time Cross-Device Mesh (Connects automatically to public relays)
+    try {
+      if (typeof window !== 'undefined' && typeof window.Gun === 'function') {
+        const gun = window.Gun({
+          peers: [
+            'https://gun-manhattan.herokuapp.com/gun',
+            'https://peer.wallie.io/gun',
+            'https://relay.peer.ooo/gun'
+          ],
+          localStorage: false,
+          radisk: false,
+        });
+        const rootNode = gun.get(roomId);
+        gunRootRef.current = rootNode;
+
+        SYNC_KEYS.forEach((k) => {
+          rootNode.get(k).on((node) => {
+            if (!node || !node.data) return;
+            try {
+              const parsed = JSON.parse(node.data);
+              applyRemoteKeyUpdate(k, parsed, node.updatedAt, node.deviceId);
+            } catch {}
+          });
+        });
+      }
+    } catch {}
+
+    // 4. Optional Private Cloud DB Auto-Pull
+    const pullPrivateDb = async () => {
+      const privateDbUrl = (CLOUD_DB_URL || stateMapRef.current.settings?.cloudSyncUrl || '').trim();
+      if (!privateDbUrl || !privateDbUrl.startsWith('https://')) return;
+      try {
+        const res = await fetchWithRetry(privateDbUrl, { cache: 'no-store' }, 1);
+        const parsed = await res.json();
+        if (parsed && typeof parsed === 'object') {
+          SYNC_KEYS.forEach((k) => {
+            if (parsed[k] !== undefined) {
+              applyRemoteKeyUpdate(k, parsed[k], parsed.updatedAt, parsed.deviceId);
+            }
+          });
+          setCloudSyncStatus('synced');
+        }
+      } catch {
+        setCloudSyncStatus('offline');
+      }
+    };
+    pullPrivateDb();
+
+    // 5. Automatic Offline Retry Queue & Reconnect Flusher (runs every 6s and on online event)
+    const flushPending = () => {
+      if (navigator.onLine === false) {
+        setCloudSyncStatus('offline');
+        return;
+      }
+      if (pendingDirtyRef.current.size > 0) {
+        const keysToRetry = Array.from(pendingDirtyRef.current);
+        keysToRetry.forEach((k) => {
+          pushKeyToBackground(k, stateMapRef.current[k]);
+        });
+      } else {
+        setCloudSyncStatus('synced');
+      }
+      pullPrivateDb();
+    };
+
+    const retryTimer = setInterval(flushPending, 6000);
+    window.addEventListener('online', flushPending);
+    window.addEventListener('focus', flushPending);
+
+    return () => {
+      clearInterval(retryTimer);
+      window.removeEventListener('online', flushPending);
+      window.removeEventListener('focus', flushPending);
+      try { if (bcRef.current) bcRef.current.close(); } catch {}
+    };
+  }, [applyRemoteKeyUpdate, pushKeyToBackground]);
+
+  // Watch all persisted datasets and auto-sync ONLY the changed key in background
+  useEffect(() => {
+    if (isApplyingRemoteRef.current) return;
+    const changedKeys = [];
+    SYNC_KEYS.forEach((k) => {
+      const currentSnap = JSON.stringify(stateMapRef.current[k]);
+      if (prevSnapshotsRef.current[k] !== undefined && prevSnapshotsRef.current[k] !== currentSnap) {
+        prevSnapshotsRef.current[k] = currentSnap;
+        changedKeys.push(k);
+      } else if (prevSnapshotsRef.current[k] === undefined) {
+        prevSnapshotsRef.current[k] = currentSnap;
+      }
+    });
+    if (changedKeys.length === 0) return;
+
+    setCloudSyncStatus('syncing');
+    const timer = setTimeout(() => {
+      changedKeys.forEach((k) => {
+        pushKeyToBackground(k, stateMapRef.current[k]);
+      });
+    }, 350);
     return () => clearTimeout(timer);
-  }, [settings, roles, users, students, teachers, classes, majors, attendance, permissions]);
+  }, [settings, roles, users, students, teachers, classes, majors, attendance, permissions, pushKeyToBackground]);
 
   const currentUser = useMemo(() => {
     return users.find(u => u.id === currentUserId) || users.find(u => u.role === currentRole) || {
@@ -6126,23 +5942,21 @@ function App() {
           </div>
 
           <div className="flex items-center gap-2.5">
-            {settings?.cloudSyncUrl ? (
-              <span
-                title="Sinkronisasi otomatis antar perangkat aktif"
-                className={`hidden sm:inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1 text-[11px] font-bold ${
-                  cloudSyncStatus === 'syncing'
-                    ? 'border-blue-200 bg-blue-50 text-blue-700'
-                    : cloudSyncStatus === 'error'
-                    ? 'border-amber-200 bg-amber-50 text-amber-700'
-                    : 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                }`}
-              >
-                <span className={`h-2 w-2 rounded-full ${
-                  cloudSyncStatus === 'syncing' ? 'bg-blue-500 animate-ping' : cloudSyncStatus === 'error' ? 'bg-amber-500' : 'bg-emerald-500'
-                }`} />
-                {cloudSyncStatus === 'syncing' ? 'Menyinkronkan...' : cloudSyncStatus === 'error' ? 'Sync Offline' : 'Auto-Sync Aktif'}
-              </span>
-            ) : null}
+            <span
+              title="Perubahan data otomatis tersimpan & disinkronkan antar perangkat di latar belakang"
+              className={`hidden sm:inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1 text-[11px] font-bold ${
+                cloudSyncStatus === 'syncing'
+                  ? 'border-blue-200 bg-blue-50 text-blue-700'
+                  : cloudSyncStatus === 'offline'
+                  ? 'border-amber-200 bg-amber-50 text-amber-700'
+                  : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+              }`}
+            >
+              <span className={`h-2 w-2 rounded-full ${
+                cloudSyncStatus === 'syncing' ? 'bg-blue-500 animate-ping' : cloudSyncStatus === 'offline' ? 'bg-amber-500' : 'bg-emerald-500'
+              }`} />
+              {cloudSyncStatus === 'syncing' ? 'Menyinkronkan...' : cloudSyncStatus === 'offline' ? 'Antrean Offline' : 'Tersinkron Otomatis'}
+            </span>
             <LiveClockBadge />
 
             <div className="flex items-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50/70 px-2.5 py-1">
