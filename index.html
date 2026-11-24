@@ -4884,6 +4884,67 @@ function SchoolSettingsView({
     }
   };
 
+  const handleEnableAutoCloudSync = async () => {
+    setSyncLoading(true);
+    try {
+      const nowTs = Date.now();
+      const payload = { ...buildFullPayload(formState), updatedAt: nowTs };
+      const res = await fetch('https://api.jsonstorage.net/v1/json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const createdUri = data?.uri;
+      if (!createdUri) throw new Error('URI Cloud tidak ditemukan');
+      const nextSettings = { ...formState, cloudSyncUrl: createdUri };
+      setFormState(nextSettings);
+      setSettings(nextSettings);
+      writePersistedValue('settings', nextSettings);
+      setHasUnsavedChanges(false);
+      addActivityLog("Mengaktifkan Auto-Sync Cloud Antar Device", createdUri, "Cloud Sync");
+      showToast("Auto-Sync Cloud aktif! Klik 'Salin Link Auto-Sync Device Lain' untuk dibuka di HP/laptop lain.");
+    } catch (err) {
+      showToast("Gagal membuat ruang Auto-Sync otomatis (" + err.message + "). Gunakan 'Download HTML Terkini' atau 'Link #sync'.", "warning");
+    } finally {
+      setSyncLoading(false);
+    }
+  };
+
+  const handleCopyAutoSyncLink = () => {
+    const cloudUrl = String(formState.cloudSyncUrl || "").trim();
+    if (!cloudUrl) return;
+    try {
+      const encodedCloud = btoa(unescape(encodeURIComponent(cloudUrl)));
+      const baseUrl = window.location.href.split('#')[0].split('?')[0];
+      const finalLink = `${baseUrl}?cloud=${encodeURIComponent(encodedCloud)}`;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(finalLink).then(() => {
+          showToast("Link Auto-Sync disalin! Buka link ini di HP/device lain agar selalu tersinkron otomatis.");
+        }).catch(() => {
+          const ta = document.createElement('textarea');
+          ta.value = finalLink;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          showToast("Link Auto-Sync disalin!");
+        });
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = finalLink;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast("Link Auto-Sync disalin!");
+      }
+    } catch {
+      showToast("Gagal menyalin link Auto-Sync.", "warning");
+    }
+  };
+
   const handleCopySyncLink = () => {
     try {
       const compactPayload = { settings: formState, roles, users, students, teachers, classes, majors };
@@ -5036,68 +5097,108 @@ function SchoolSettingsView({
         </div>
       </div>
 
-      {/* Cross-Device Persistence & Cloud Sync Panel */}
-      <div className="rounded-2xl border border-indigo-200 bg-gradient-to-r from-indigo-50/80 via-white to-blue-50/70 p-5 shadow-xs space-y-4">
-        <div className="flex flex-col justify-between gap-3 md:flex-row md:items-center">
+      {/* Simplified 1-Click Auto-Sync Across Devices */}
+      <div className="rounded-2xl border border-indigo-200 bg-gradient-to-r from-indigo-50/90 via-white to-cyan-50/80 p-5 shadow-xs space-y-4">
+        <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
           <div>
-            <div className="inline-flex items-center gap-1.5 rounded-full bg-indigo-100 px-3 py-0.5 text-[11px] font-bold text-indigo-800 mb-1">
-              <RefreshCw className="h-3.5 w-3.5" /> Sinkronisasi Antar Device & Hosting Website
+            <div className="flex flex-wrap items-center gap-2 mb-1">
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-100 px-3 py-0.5 text-[11px] font-bold text-indigo-800">
+                <RefreshCw className="h-3.5 w-3.5" /> Auto-Sync Otomatis Antar Device
+              </span>
+              {formState.cloudSyncUrl ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-0.5 text-[11px] font-bold text-emerald-800">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+                  Auto-Sync Aktif (Otomatis Tersimpan ke Cloud)
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-200 px-2.5 py-0.5 text-[11px] font-bold text-slate-700">
+                  Belum Diaktifkan
+                </span>
+              )}
             </div>
-            <h3 className="text-sm font-extrabold text-slate-900">Agar Data Tidak Kembali ke Setelan Awal Saat Pindah Device</h3>
+            <h3 className="text-sm font-extrabold text-slate-900">Sinkronisasi Otomatis Setiap Berpindah Perangkat</h3>
             <p className="text-xs text-slate-600 mt-0.5">
-              Penyimpanan browser (localStorage) hanya tersimpan di 1 perangkat. Gunakan salah satu cara di bawah agar perubahan permanen di semua HP/Laptop:
+              {formState.cloudSyncUrl
+                ? "Setiap perubahan data di menu ini otomatis tersinkron ke Cloud & perangkat lain tanpa perlu upload ulang."
+                : "Klik tombol di kanan sekali saja untuk mengaktifkan Auto-Sync Cloud agar data otomatis terbawa saat pindah HP atau laptop."}
             </p>
           </div>
+
           <div className="flex flex-wrap gap-2 shrink-0">
+            {!formState.cloudSyncUrl ? (
+              <button
+                type="button"
+                disabled={syncLoading}
+                onClick={handleEnableAutoCloudSync}
+                className="flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-xs font-extrabold text-white shadow-md shadow-indigo-600/20 hover:bg-indigo-700 disabled:opacity-50"
+              >
+                <Sparkles className="h-4 w-4" />
+                {syncLoading ? "Mengaktifkan..." : "Aktifkan Auto-Sync (1-Klik)"}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleCopyAutoSyncLink}
+                className="flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-xs font-extrabold text-white shadow-md hover:bg-emerald-700"
+              >
+                <CheckCircle2 className="h-4 w-4" /> Salin Link Auto-Sync Device Lain
+              </button>
+            )}
             <button
               type="button"
               onClick={handleDownloadBakedHTML}
-              className="flex items-center gap-1.5 rounded-xl bg-indigo-600 px-3.5 py-2 text-xs font-extrabold text-white shadow-sm hover:bg-indigo-700"
+              className="flex items-center gap-1.5 rounded-xl border border-indigo-200 bg-white px-3.5 py-2.5 text-xs font-bold text-indigo-700 hover:bg-indigo-50"
+              title="Unduh file HTML yang sudah berisi data terbaru untuk di-upload ulang ke hosting"
             >
-              <Download className="h-4 w-4" /> Download HTML Terkini (Untuk Upload Hosting)
-            </button>
-            <button
-              type="button"
-              onClick={handleCopySyncLink}
-              className="flex items-center gap-1.5 rounded-xl border border-indigo-200 bg-white px-3.5 py-2 text-xs font-bold text-indigo-700 hover:bg-indigo-50"
-            >
-              <Upload className="h-4 w-4" /> Salin Link Pindah Device
+              <Download className="h-4 w-4" /> Download HTML Terkini
             </button>
           </div>
         </div>
 
-        <div className="grid grid-cols-1 gap-3 border-t border-indigo-100 pt-3 md:grid-cols-12 md:items-center">
-          <div className="md:col-span-7">
-            <label className="block text-[11px] font-bold text-slate-700 mb-1">
-              URL Cloud Sync Otomatis (Opsional — Firebase Realtime DB / REST JSON URL):
-            </label>
-            <input
-              type="url"
-              value={formState.cloudSyncUrl || ""}
-              onChange={(e) => handleFieldChange("cloudSyncUrl", e.target.value)}
-              placeholder="Contoh: https://siakad-sekolah-default-rtdb.firebaseio.com/data.json"
-              className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-mono focus:border-indigo-600 focus:outline-none"
-            />
+        <details className="rounded-xl border border-indigo-100 bg-white/80 px-4 py-2.5 text-xs">
+          <summary className="cursor-pointer font-bold text-slate-700 select-none">
+            Pengaturan Lanjutan Cloud Sync (Atur URL Sendiri / Firebase / Salin Link Manual)
+          </summary>
+          <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-12 md:items-center">
+            <div className="md:col-span-7">
+              <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                Endpoint Cloud URL (Otomatis terisi atau masukkan Firebase/REST JSON URL Anda):
+              </label>
+              <input
+                type="url"
+                value={formState.cloudSyncUrl || ""}
+                onChange={(e) => handleFieldChange("cloudSyncUrl", e.target.value)}
+                placeholder="https://api.jsonstorage.net/v1/json/..."
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-mono focus:border-indigo-600 focus:outline-none"
+              />
+            </div>
+            <div className="flex flex-wrap gap-2 md:col-span-5 md:pt-4">
+              <button
+                type="button"
+                disabled={syncLoading}
+                onClick={() => pushAllToCloud(formState.cloudSyncUrl)}
+                className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-bold text-white hover:bg-slate-800 disabled:opacity-50"
+              >
+                Sync Sekarang
+              </button>
+              <button
+                type="button"
+                disabled={syncLoading}
+                onClick={() => pullAllFromCloud(formState.cloudSyncUrl)}
+                className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
+              >
+                Tarik Data
+              </button>
+              <button
+                type="button"
+                onClick={handleCopySyncLink}
+                className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50"
+              >
+                Link #sync
+              </button>
+            </div>
           </div>
-          <div className="flex flex-wrap gap-2 md:col-span-5 md:pt-4">
-            <button
-              type="button"
-              disabled={syncLoading}
-              onClick={() => pushAllToCloud(formState.cloudSyncUrl)}
-              className="flex-1 rounded-xl bg-slate-900 px-3 py-2 text-xs font-bold text-white hover:bg-slate-800 disabled:opacity-50"
-            >
-              {syncLoading ? "Memproses..." : "Push ke Cloud"}
-            </button>
-            <button
-              type="button"
-              disabled={syncLoading}
-              onClick={() => pullAllFromCloud(formState.cloudSyncUrl)}
-              className="flex-1 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
-            >
-              {syncLoading ? "Memproses..." : "Tarik dari Cloud"}
-            </button>
-          </div>
-        </div>
+        </details>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-blue-100 bg-gradient-to-r from-blue-50/80 via-white to-cyan-50/60 p-4 shadow-xs">
@@ -5474,9 +5575,45 @@ function App() {
   const toastTimerRef = useRef(null);
   const storageMode = useMemo(() => detectStorageMode(), []);
 
-  // Auto-save #sync= URL data to local storage & clear hash cleanly
+  const [cloudSyncStatus, setCloudSyncStatus] = useState('idle'); // 'idle' | 'syncing' | 'synced' | 'error'
+  const lastCloudUpdatedAtRef = useRef(0);
+  const skipNextAutoPushRef = useRef(false);
+
+  const applyCloudPayload = useCallback((parsed) => {
+    if (!parsed || typeof parsed !== 'object') return false;
+    const remoteTs = Number(parsed.updatedAt || 0);
+    if (remoteTs && remoteTs <= lastCloudUpdatedAtRef.current) return false;
+    skipNextAutoPushRef.current = true;
+    if (remoteTs) lastCloudUpdatedAtRef.current = remoteTs;
+    if (parsed.settings) setSettings(parsed.settings);
+    if (parsed.roles) setRoles(parsed.roles);
+    if (parsed.users) setUsers(parsed.users);
+    if (parsed.students) setStudents(parsed.students);
+    if (parsed.teachers) setTeachers(parsed.teachers);
+    if (parsed.classes) setClasses(parsed.classes);
+    if (parsed.majors) setMajors(parsed.majors);
+    if (parsed.attendance) setAttendance(parsed.attendance);
+    if (parsed.permissions) setPermissions(parsed.permissions);
+    setTimeout(() => { skipNextAutoPushRef.current = false; }, 1200);
+    return true;
+  }, [setSettings, setRoles, setUsers, setStudents, setTeachers, setClasses, setMajors, setAttendance, setPermissions]);
+
+  // 1. Auto-save #sync= URL data or ?cloud= endpoint on startup
   useEffect(() => {
     try {
+      const params = new URLSearchParams(window.location.search);
+      const cloudParam = params.get('cloud');
+      if (cloudParam) {
+        let decodedUrl = cloudParam;
+        try {
+          if (!cloudParam.startsWith('https://')) {
+            decodedUrl = decodeURIComponent(escape(atob(cloudParam)));
+          }
+        } catch {}
+        if (decodedUrl.startsWith('https://')) {
+          setSettings(prev => ({ ...prev, cloudSyncUrl: decodedUrl }));
+        }
+      }
       if (window.location.hash && window.location.hash.startsWith('#sync=')) {
         const seed = getEmbeddedSeed();
         if (seed && typeof seed === 'object') {
@@ -5489,30 +5626,75 @@ function App() {
         }
       }
     } catch {}
-  }, []);
+  }, [setSettings]);
 
-  // Auto-pull latest data from Cloud Sync URL on startup if configured
+  // 2. Auto-pull from Cloud on startup, tab focus, and every 15s
+  useEffect(() => {
+    const url = settings?.cloudSyncUrl;
+    if (!url || !url.startsWith('https://')) {
+      setCloudSyncStatus('idle');
+      return;
+    }
+    let cancelled = false;
+    const pullNow = async () => {
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const parsed = await res.json();
+        if (cancelled) return;
+        applyCloudPayload(parsed);
+        setCloudSyncStatus('synced');
+      } catch {
+        if (!cancelled) setCloudSyncStatus('error');
+      }
+    };
+    pullNow();
+    const intervalId = setInterval(pullNow, 15000);
+    const onFocus = () => pullNow();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [settings?.cloudSyncUrl, applyCloudPayload]);
+
+  // 3. Auto-push ANY state change to Cloud (debounced 1s) so switching devices never loses edits
   useEffect(() => {
     const url = settings?.cloudSyncUrl;
     if (!url || !url.startsWith('https://')) return;
-    let cancelled = false;
-    fetch(url)
-      .then(res => res.ok ? res.json() : null)
-      .then(parsed => {
-        if (cancelled || !parsed || typeof parsed !== 'object') return;
-        if (parsed.settings) setSettings(parsed.settings);
-        if (parsed.roles) setRoles(parsed.roles);
-        if (parsed.users) setUsers(parsed.users);
-        if (parsed.students) setStudents(parsed.students);
-        if (parsed.teachers) setTeachers(parsed.teachers);
-        if (parsed.classes) setClasses(parsed.classes);
-        if (parsed.majors) setMajors(parsed.majors);
-        if (parsed.attendance) setAttendance(parsed.attendance);
-        if (parsed.permissions) setPermissions(parsed.permissions);
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, []);
+    if (skipNextAutoPushRef.current) return;
+    const timer = setTimeout(async () => {
+      setCloudSyncStatus('syncing');
+      try {
+        const nowTs = Date.now();
+        lastCloudUpdatedAtRef.current = nowTs;
+        const payload = {
+          updatedAt: nowTs,
+          exportedAt: new Date(nowTs).toISOString(),
+          settings,
+          roles,
+          users,
+          students,
+          teachers,
+          classes,
+          majors,
+          attendance,
+          permissions,
+        };
+        const res = await fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        setCloudSyncStatus('synced');
+      } catch {
+        setCloudSyncStatus('error');
+      }
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [settings, roles, users, students, teachers, classes, majors, attendance, permissions]);
 
   const currentUser = useMemo(() => {
     return users.find(u => u.id === currentUserId) || users.find(u => u.role === currentRole) || {
@@ -5844,6 +6026,23 @@ function App() {
           </div>
 
           <div className="flex items-center gap-2.5">
+            {settings?.cloudSyncUrl ? (
+              <span
+                title="Sinkronisasi otomatis antar perangkat aktif"
+                className={`hidden sm:inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1 text-[11px] font-bold ${
+                  cloudSyncStatus === 'syncing'
+                    ? 'border-blue-200 bg-blue-50 text-blue-700'
+                    : cloudSyncStatus === 'error'
+                    ? 'border-amber-200 bg-amber-50 text-amber-700'
+                    : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                }`}
+              >
+                <span className={`h-2 w-2 rounded-full ${
+                  cloudSyncStatus === 'syncing' ? 'bg-blue-500 animate-ping' : cloudSyncStatus === 'error' ? 'bg-amber-500' : 'bg-emerald-500'
+                }`} />
+                {cloudSyncStatus === 'syncing' ? 'Menyinkronkan...' : cloudSyncStatus === 'error' ? 'Sync Offline' : 'Auto-Sync Aktif'}
+              </span>
+            ) : null}
             <LiveClockBadge />
 
             <div className="flex items-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50/70 px-2.5 py-1">
