@@ -214,7 +214,7 @@ const writePersistedValue = (key, value) => {
 // - Jika di-upload bersama file sync.php ke hosting website, otomatis terhubung tanpa setting apa pun!
 // - Jika pakai hosting statis (GitHub Pages / Netlify / Vercel), isi 1 baris CLOUD_DB_URL (Firebase) di bawah.
 // ============================================================================
-const CLOUD_DB_URL = "https://dharma-406b5-default-rtdb.firebaseio.com/siakad.json"; // Opsional untuk hosting statis: contoh "https://nama-project-default-rtdb.firebaseio.com/siakad.json"
+const CLOUD_DB_URL = "https://dharma-406b5-default-rtdb.firebaseio.com/"; // Opsional untuk hosting statis: contoh "https://nama-project-default-rtdb.firebaseio.com/siakad.json"
 
 const SYNC_KEYS = [
   'settings', 'roles', 'users', 'students',
@@ -243,14 +243,28 @@ const getAutoSyncRoomId = () => {
   }
 };
 
+const normalizeCloudUrl = (raw) => {
+  let u = String(raw || '').trim();
+  if (!u) return '';
+  if (!u.startsWith('http://') && !u.startsWith('https://')) {
+    u = 'https://' + u;
+  }
+  const isFirebase = u.includes('firebaseio.com') || u.includes('firebasedatabase.app');
+  if (isFirebase && !u.toLowerCase().endsWith('.json')) {
+    u = u.replace(/\/+$/, '') + '/siakad.json';
+  }
+  return u;
+};
+
 const getServerSyncEndpoint = () => {
-  if (CLOUD_DB_URL && CLOUD_DB_URL.startsWith('https://')) {
-    return { url: CLOUD_DB_URL, type: 'firebase' };
+  const normalizedCloud = normalizeCloudUrl(CLOUD_DB_URL);
+  if (normalizedCloud && normalizedCloud.startsWith('https://')) {
+    return { url: normalizedCloud, type: 'firebase' };
   }
   try {
     const isHostedWeb =
       window.location &&
-      window.location.protocol === 'https:' &&
+      (window.location.protocol === 'https:' || window.location.protocol === 'http:') &&
       window.location.origin !== 'null' &&
       window.location.hostname &&
       !window.location.hostname.includes('googleusercontent.com');
@@ -4710,7 +4724,7 @@ function ActivityLogsView({ logs }) {
 // TOP-LEVEL MODULE 14: EDIT DATA SEKOLAH & PENGATURAN SISTEM
 // ============================================================================
 function SchoolSettingsView({
-  cloudSyncStatus, settings, setSettings, roles, setRoles, users, setUsers,
+  cloudSyncStatus, syncErrorDetail, onRetrySync, settings, setSettings, roles, setRoles, users, setUsers,
   students, setStudents, teachers, setTeachers, classes, setClasses,
   majors, setMajors, attendance, setAttendance, permissions, setPermissions,
   todayStr, storageMode, handleResetDemoData, addActivityLog, addNotification, showToast
@@ -4998,20 +5012,35 @@ function SchoolSettingsView({
             <p className="text-[11px] text-slate-600">
               {cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing'
                 ? 'Setiap perubahan data langsung tersimpan ke server database Anda dan otomatis dimuat di semua HP & laptop yang login.'
-                : 'Upload file sync.php ke folder yang sama dengan file HTML ini di hosting (cPanel/Hostinger/XAMPP), atau isi CLOUD_DB_URL (Firebase) untuk hosting statis.'}
+                : (syncErrorDetail || 'Upload file sync.php ke folder yang sama dengan file HTML ini di hosting (cPanel/Hostinger/XAMPP), atau isi CLOUD_DB_URL (Firebase) untuk hosting statis.')}
             </p>
           </div>
         </div>
-        <span className={`inline-flex shrink-0 items-center gap-1.5 self-start sm:self-center rounded-full px-3 py-1 text-[11px] font-extrabold ${
-          cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing'
-            ? 'bg-emerald-100 text-emerald-800'
-            : 'bg-amber-100 text-amber-800'
-        }`}>
-          <span className={`h-2 w-2 rounded-full ${
-            cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing' ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
-          }`} />
-          {cloudSyncStatus === 'synced' ? 'Server Aktif' : cloudSyncStatus === 'syncing' ? 'Menyinkronkan...' : 'Mode Lokal'}
-        </span>
+        <div className="flex items-center gap-2 shrink-0 self-start sm:self-center">
+          <button
+            type="button"
+            onClick={() => onRetrySync && onRetrySync()}
+            className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-bold text-slate-700 hover:bg-slate-50"
+          >
+            Tes Koneksi
+          </button>
+          <span className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-extrabold ${
+            cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing'
+              ? 'bg-emerald-100 text-emerald-800'
+              : cloudSyncStatus === 'error'
+              ? 'bg-rose-100 text-rose-800'
+              : 'bg-amber-100 text-amber-800'
+          }`}>
+            <span className={`h-2 w-2 rounded-full ${
+              cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing'
+                ? 'bg-emerald-500 animate-pulse'
+                : cloudSyncStatus === 'error'
+                ? 'bg-rose-500'
+                : 'bg-amber-500'
+            }`} />
+            {cloudSyncStatus === 'synced' ? 'Server Aktif' : cloudSyncStatus === 'syncing' ? 'Menyinkronkan...' : cloudSyncStatus === 'error' ? 'Gagal Koneksi' : 'Mode Lokal'}
+          </span>
+        </div>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-blue-100 bg-gradient-to-r from-blue-50/80 via-white to-cyan-50/60 p-4 shadow-xs">
@@ -5389,6 +5418,7 @@ function App() {
   const storageMode = useMemo(() => detectStorageMode(), []);
 
   const [cloudSyncStatus, setCloudSyncStatus] = useState('checking'); // 'checking' | 'synced' | 'syncing' | 'local_only' | 'error'
+  const [syncErrorDetail, setSyncErrorDetail] = useState('');
   const deviceIdRef = useRef(getDeviceId());
   const syncMetaRef = useRef(readSyncMeta());
   const pendingDirtyRef = useRef(new Set());
@@ -5438,49 +5468,6 @@ function App() {
     setTimeout(() => { isApplyingRemoteRef.current = false; }, 120);
   }, []);
 
-  const pullFromServer = useCallback(async () => {
-    const ep = serverEndpointRef.current;
-    if (!ep) {
-      setCloudSyncStatus('local_only');
-      return false;
-    }
-    try {
-      const res = await fetchWithRetry(ep.url + (ep.type === 'php' ? '?t=' + Date.now() : ''), {
-        method: 'GET',
-        cache: 'no-store',
-        headers: { 'Accept': 'application/json' }
-      }, 1);
-      const text = await res.text();
-      if (!text || text.trim().startsWith('<')) {
-        // Hosting returned HTML (e.g., 404 page or PHP not executed)
-        serverVerifiedRef.current = false;
-        setCloudSyncStatus('local_only');
-        return false;
-      }
-      const parsed = JSON.parse(text);
-      serverVerifiedRef.current = true;
-      if (parsed && typeof parsed === 'object') {
-        const meta = parsed._meta || {};
-        SYNC_KEYS.forEach((k) => {
-          if (parsed[k] !== undefined && parsed[k] !== null) {
-            const keyTs = Number(meta[k]?.updatedAt || parsed.updatedAt || 1);
-            const keyDev = meta[k]?.deviceId || parsed.deviceId || '';
-            applyRemoteKeyUpdate(k, parsed[k], keyTs, keyDev);
-          }
-        });
-      }
-      setCloudSyncStatus('synced');
-      return true;
-    } catch {
-      if (!serverVerifiedRef.current) {
-        setCloudSyncStatus('local_only');
-      } else {
-        setCloudSyncStatus('error');
-      }
-      return false;
-    }
-  }, [applyRemoteKeyUpdate]);
-
   const pushKeysToServer = useCallback(async (keysToPush) => {
     if (!keysToPush || keysToPush.length === 0) return;
     const nowTs = Date.now();
@@ -5509,7 +5496,6 @@ function App() {
       if (ep.type === 'php') {
         await fetchWithRetry(ep.url, {
           method: 'POST',
-          keepalive: true,
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             updatedAt: nowTs,
@@ -5527,7 +5513,6 @@ function App() {
         });
         await fetchWithRetry(ep.url, {
           method: 'PUT',
-          keepalive: true,
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             updatedAt: nowTs,
@@ -5538,12 +5523,81 @@ function App() {
         }, 2);
       }
       keysToPush.forEach((k) => pendingDirtyRef.current.delete(k));
+      setSyncErrorDetail('');
       setCloudSyncStatus('synced');
-    } catch {
+    } catch (err) {
       keysToPush.forEach((k) => pendingDirtyRef.current.add(k));
+      const msg = String(err?.message || '');
+      if (msg.includes('401') || msg.includes('403')) {
+        setSyncErrorDetail('Akses ditolak (HTTP 401/403): Ubah Rules Firebase Realtime Database (.read & .write) menjadi true.');
+      } else {
+        setSyncErrorDetail('Gagal mengirim perubahan ke server (' + (msg || 'cek koneksi internet') + ').');
+      }
       setCloudSyncStatus('error');
     }
   }, []);
+
+  const pullFromServer = useCallback(async () => {
+    const ep = serverEndpointRef.current;
+    if (!ep) {
+      setCloudSyncStatus('local_only');
+      setSyncErrorDetail('CLOUD_DB_URL masih kosong dan file belum berada di hosting web.');
+      return false;
+    }
+    try {
+      const fetchUrl = ep.type === 'php' ? `${ep.url}?t=${Date.now()}` : ep.url;
+      const res = await fetchWithRetry(fetchUrl, {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { 'Accept': 'application/json' }
+      }, 1);
+      const text = await res.text();
+      if (!text || text.trim().startsWith('<')) {
+        serverVerifiedRef.current = false;
+        setCloudSyncStatus('local_only');
+        setSyncErrorDetail(
+          ep.type === 'firebase'
+            ? 'URL Firebase mengembalikan halaman HTML, pastikan URL benar dan berakhiran /siakad.json.'
+            : 'File sync.php tidak ditemukan di folder hosting atau hosting tidak mendukung PHP.'
+        );
+        return false;
+      }
+      const parsed = JSON.parse(text);
+      serverVerifiedRef.current = true;
+      setSyncErrorDetail('');
+      if (parsed && typeof parsed === 'object') {
+        const meta = parsed._meta || {};
+        SYNC_KEYS.forEach((k) => {
+          if (parsed[k] !== undefined && parsed[k] !== null) {
+            const keyTs = Number(meta[k]?.updatedAt || parsed.updatedAt || 1);
+            const keyDev = meta[k]?.deviceId || parsed.deviceId || '';
+            applyRemoteKeyUpdate(k, parsed[k], keyTs, keyDev);
+          }
+        });
+      } else if (parsed === null && ep.type === 'firebase') {
+        // Brand-new empty Firebase database: automatically seed initial data
+        pushKeysToServer(SYNC_KEYS);
+      }
+      setCloudSyncStatus('synced');
+      return true;
+    } catch (err) {
+      const msg = String(err?.message || '');
+      if (ep.type === 'firebase') {
+        if (msg.includes('401') || msg.includes('403')) {
+          setSyncErrorDetail('Firebase menolak akses (HTTP 401/403): Buka Firebase Console -> Realtime Database -> Rules, ubah ".read": true dan ".write": true lalu Publish.');
+        } else if (msg.includes('404')) {
+          setSyncErrorDetail('URL Firebase tidak ditemukan (HTTP 404): Periksa kembali alamat CLOUD_DB_URL Anda.');
+        } else {
+          setSyncErrorDetail('Gagal terhubung ke CLOUD_DB_URL (' + (msg || 'cek koneksi/URL') + ').');
+        }
+        setCloudSyncStatus('error');
+      } else {
+        setSyncErrorDetail('sync.php belum terpasang di folder hosting (' + (msg || '404') + ').');
+        setCloudSyncStatus(serverVerifiedRef.current ? 'error' : 'local_only');
+      }
+      return false;
+    }
+  }, [applyRemoteKeyUpdate, pushKeysToServer]);
 
   // Initialize Server Auto-Sync & BroadcastChannel on Mount
   useEffect(() => {
@@ -6180,6 +6234,8 @@ function App() {
           {activeMenu === "settings" && (
             <SchoolSettingsView
               cloudSyncStatus={cloudSyncStatus}
+              syncErrorDetail={syncErrorDetail}
+              onRetrySync={pullFromServer}
               settings={settings}
               setSettings={setSettings}
               roles={roles}
