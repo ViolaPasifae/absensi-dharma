@@ -22,7 +22,6 @@
   <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.26.4/babel.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/gun@0.2020.1241/gun.js"></script>
   <style>
     body {
       font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
@@ -211,13 +210,11 @@ const writePersistedValue = (key, value) => {
 };
 
 // ============================================================================
-// ZERO-CONFIG AUTOMATIC BACKGROUND SYNC ENGINE
-// - Berjalan otomatis di background tanpa perlu kode/link/tombol manual
-// - Sinkronisasi per-modul (settings, students, attendance, dll.) dengan timestamp
-// - BroadcastChannel (instan antar tab) + GunDB Mesh (otomatis antar device) + Optional Cloud DB URL
-// - Offline Retry Queue agar perubahan tidak pernah hilang saat koneksi putus
+// AUTOMATIC SERVER BACKGROUND SYNC ENGINE (./sync.php atau Firebase Realtime DB)
+// - Jika di-upload bersama file sync.php ke hosting website, otomatis terhubung tanpa setting apa pun!
+// - Jika pakai hosting statis (GitHub Pages / Netlify / Vercel), isi 1 baris CLOUD_DB_URL (Firebase) di bawah.
 // ============================================================================
-const CLOUD_DB_URL = ""; // Opsional: isi URL Firebase Realtime DB sekolah Anda (https://...firebaseio.com/siakad.json) jika ingin server privat 100%
+const CLOUD_DB_URL = ""; // Opsional untuk hosting statis: contoh "https://nama-project-default-rtdb.firebaseio.com/siakad.json"
 
 const SYNC_KEYS = [
   'settings', 'roles', 'users', 'students',
@@ -240,11 +237,28 @@ const getDeviceId = () => {
 const getAutoSyncRoomId = () => {
   try {
     const host = (window.location.hostname || 'siakad-local').toLowerCase().replace(/[^a-z0-9.-]/g, '');
-    const path = (window.location.pathname || '/').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24);
-    return `siakad_autosync_v4_${host}_${path || 'root'}`;
+    return `siakad_sync_v5_${host}`;
   } catch {
-    return 'siakad_autosync_v4_default';
+    return 'siakad_sync_v5_default';
   }
+};
+
+const getServerSyncEndpoint = () => {
+  if (CLOUD_DB_URL && CLOUD_DB_URL.startsWith('https://')) {
+    return { url: CLOUD_DB_URL, type: 'firebase' };
+  }
+  try {
+    const isHostedWeb =
+      window.location &&
+      window.location.protocol === 'https:' &&
+      window.location.origin !== 'null' &&
+      window.location.hostname &&
+      !window.location.hostname.includes('googleusercontent.com');
+    if (isHostedWeb) {
+      return { url: './sync.php', type: 'php' };
+    }
+  } catch {}
+  return null;
 };
 
 const readSyncMeta = () => readPersistedValue('__sync_meta__', {});
@@ -260,20 +274,11 @@ const fetchWithRetry = async (url, options = {}, retries = 2) => {
     } catch (err) {
       lastErr = err;
       if (i < retries) {
-        await new Promise(r => setTimeout(r, 800 * (i + 1)));
+        await new Promise(r => setTimeout(r, 600 * (i + 1)));
       }
     }
   }
   throw lastErr;
-};
-
-const sanitizeForSync = (key, value) => {
-  if (key === 'settings' && value && typeof value === 'object') {
-    if (value.logoUrl && value.logoUrl.length > 12000) {
-      return { ...value, logoUrl: '' };
-    }
-  }
-  return value;
 };
 
 const detectStorageMode = () => {
@@ -4705,7 +4710,7 @@ function ActivityLogsView({ logs }) {
 // TOP-LEVEL MODULE 14: EDIT DATA SEKOLAH & PENGATURAN SISTEM
 // ============================================================================
 function SchoolSettingsView({
-  settings, setSettings, roles, setRoles, users, setUsers,
+  cloudSyncStatus, settings, setSettings, roles, setRoles, users, setUsers,
   students, setStudents, teachers, setTeachers, classes, setClasses,
   majors, setMajors, attendance, setAttendance, permissions, setPermissions,
   todayStr, storageMode, handleResetDemoData, addActivityLog, addNotification, showToast
@@ -4970,24 +4975,42 @@ function SchoolSettingsView({
         </div>
       </div>
 
-      {/* Clean Automatic Background Sync Info (Zero Setup Needed) */}
-      <div className="flex flex-col justify-between gap-3 rounded-2xl border border-emerald-200 bg-gradient-to-r from-emerald-50/90 via-white to-cyan-50/70 px-5 py-3.5 shadow-xs sm:flex-row sm:items-center">
+      {/* Honest Automatic Server Sync Status Banner */}
+      <div className={`flex flex-col justify-between gap-3 rounded-2xl border px-5 py-3.5 shadow-xs sm:flex-row sm:items-center ${
+        cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing'
+          ? 'border-emerald-200 bg-gradient-to-r from-emerald-50/90 via-white to-cyan-50/70'
+          : 'border-amber-200 bg-gradient-to-r from-amber-50/90 via-white to-orange-50/60'
+      }`}>
         <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
+          <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${
+            cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing'
+              ? 'bg-emerald-100 text-emerald-700'
+              : 'bg-amber-100 text-amber-700'
+          }`}>
             <RefreshCw className="h-4 w-4" />
           </div>
           <div>
             <p className="text-xs font-extrabold text-slate-900">
-              Sinkronisasi Otomatis Antar Perangkat Berjalan di Latar Belakang
+              {cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing'
+                ? 'Sinkronisasi Server Aktif — Semua Perangkat Otomatis Terhubung'
+                : 'Mode Penyimpanan Lokal — Pasang sync.php di Hosting untuk Sinkron Antar Device'}
             </p>
             <p className="text-[11px] text-slate-600">
-              Setiap perubahan data otomatis tersimpan dan terhubung ke semua HP & laptop yang membuka website ini tanpa perlu pengaturan manual.
+              {cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing'
+                ? 'Setiap perubahan data langsung tersimpan ke server database Anda dan otomatis dimuat di semua HP & laptop yang login.'
+                : 'Upload file sync.php ke folder yang sama dengan file HTML ini di hosting (cPanel/Hostinger/XAMPP), atau isi CLOUD_DB_URL (Firebase) untuk hosting statis.'}
             </p>
           </div>
         </div>
-        <span className="inline-flex shrink-0 items-center gap-1.5 self-start sm:self-center rounded-full bg-emerald-100 px-3 py-1 text-[11px] font-extrabold text-emerald-800">
-          <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-          Auto-Sync Aktif
+        <span className={`inline-flex shrink-0 items-center gap-1.5 self-start sm:self-center rounded-full px-3 py-1 text-[11px] font-extrabold ${
+          cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing'
+            ? 'bg-emerald-100 text-emerald-800'
+            : 'bg-amber-100 text-amber-800'
+        }`}>
+          <span className={`h-2 w-2 rounded-full ${
+            cloudSyncStatus === 'synced' || cloudSyncStatus === 'syncing' ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+          }`} />
+          {cloudSyncStatus === 'synced' ? 'Server Aktif' : cloudSyncStatus === 'syncing' ? 'Menyinkronkan...' : 'Mode Lokal'}
         </span>
       </div>
 
@@ -5365,11 +5388,12 @@ function App() {
   const toastTimerRef = useRef(null);
   const storageMode = useMemo(() => detectStorageMode(), []);
 
-  const [cloudSyncStatus, setCloudSyncStatus] = useState('synced'); // 'syncing' | 'synced' | 'offline'
+  const [cloudSyncStatus, setCloudSyncStatus] = useState('checking'); // 'checking' | 'synced' | 'syncing' | 'local_only' | 'error'
   const deviceIdRef = useRef(getDeviceId());
   const syncMetaRef = useRef(readSyncMeta());
   const pendingDirtyRef = useRef(new Set());
-  const gunRootRef = useRef(null);
+  const serverEndpointRef = useRef(null);
+  const serverVerifiedRef = useRef(false);
   const bcRef = useRef(null);
   const isApplyingRemoteRef = useRef(false);
   const prevSnapshotsRef = useRef({});
@@ -5393,109 +5417,143 @@ function App() {
     permissions: setPermissions,
   };
 
-  // Apply remote update safely without causing push echo loops
   const applyRemoteKeyUpdate = useCallback((key, value, remoteUpdatedAt, fromDeviceId) => {
     if (!SYNC_KEYS.includes(key)) return;
     if (fromDeviceId && fromDeviceId === deviceIdRef.current) return;
     const localTs = Number(syncMetaRef.current[key] || 0);
     const incomingTs = Number(remoteUpdatedAt || 0);
-    if (incomingTs && incomingTs <= localTs) return;
+    if (incomingTs && localTs && incomingTs <= localTs) return;
     if (value === undefined || value === null) return;
 
     const setter = setterMapRef.current[key];
     if (!setter) return;
 
     isApplyingRemoteRef.current = true;
-    const serialized = JSON.stringify(value);
-    prevSnapshotsRef.current[key] = serialized;
+    prevSnapshotsRef.current[key] = JSON.stringify(value);
     if (incomingTs) {
       syncMetaRef.current[key] = incomingTs;
       writeSyncMeta(syncMetaRef.current);
     }
     setter(value);
-    setCloudSyncStatus('synced');
-    setTimeout(() => { isApplyingRemoteRef.current = false; }, 150);
+    setTimeout(() => { isApplyingRemoteRef.current = false; }, 120);
   }, []);
 
-  // Push a single changed key across all active background channels
-  const pushKeyToBackground = useCallback(async (key, value) => {
-    const cleanValue = sanitizeForSync(key, value);
+  const pullFromServer = useCallback(async () => {
+    const ep = serverEndpointRef.current;
+    if (!ep) {
+      setCloudSyncStatus('local_only');
+      return false;
+    }
+    try {
+      const res = await fetchWithRetry(ep.url + (ep.type === 'php' ? '?t=' + Date.now() : ''), {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { 'Accept': 'application/json' }
+      }, 1);
+      const text = await res.text();
+      if (!text || text.trim().startsWith('<')) {
+        // Hosting returned HTML (e.g., 404 page or PHP not executed)
+        serverVerifiedRef.current = false;
+        setCloudSyncStatus('local_only');
+        return false;
+      }
+      const parsed = JSON.parse(text);
+      serverVerifiedRef.current = true;
+      if (parsed && typeof parsed === 'object') {
+        const meta = parsed._meta || {};
+        SYNC_KEYS.forEach((k) => {
+          if (parsed[k] !== undefined && parsed[k] !== null) {
+            const keyTs = Number(meta[k]?.updatedAt || parsed.updatedAt || 1);
+            const keyDev = meta[k]?.deviceId || parsed.deviceId || '';
+            applyRemoteKeyUpdate(k, parsed[k], keyTs, keyDev);
+          }
+        });
+      }
+      setCloudSyncStatus('synced');
+      return true;
+    } catch {
+      if (!serverVerifiedRef.current) {
+        setCloudSyncStatus('local_only');
+      } else {
+        setCloudSyncStatus('error');
+      }
+      return false;
+    }
+  }, [applyRemoteKeyUpdate]);
+
+  const pushKeysToServer = useCallback(async (keysToPush) => {
+    if (!keysToPush || keysToPush.length === 0) return;
     const nowTs = Date.now();
-    syncMetaRef.current[key] = nowTs;
+    const updates = {};
+    keysToPush.forEach((k) => {
+      syncMetaRef.current[k] = nowTs;
+      updates[k] = stateMapRef.current[k];
+      try {
+        if (bcRef.current) {
+          bcRef.current.postMessage({
+            key: k,
+            updatedAt: nowTs,
+            deviceId: deviceIdRef.current,
+            data: JSON.stringify(stateMapRef.current[k]),
+          });
+        }
+      } catch {}
+    });
     writeSyncMeta(syncMetaRef.current);
 
-    const envelope = {
-      key,
-      updatedAt: nowTs,
-      deviceId: deviceIdRef.current,
-      data: JSON.stringify(cleanValue),
-    };
+    const ep = serverEndpointRef.current;
+    if (!ep || !serverVerifiedRef.current) return;
 
-    // Channel 1: Instant same-device multi-tab sync via BroadcastChannel
+    setCloudSyncStatus('syncing');
     try {
-      if (bcRef.current) {
-        bcRef.current.postMessage(envelope);
-      }
-    } catch {}
-
-    // Channel 2: Zero-config real-time cross-device mesh sync via GunDB
-    let meshOk = false;
-    try {
-      if (gunRootRef.current) {
-        gunRootRef.current.get(key).put({
-          updatedAt: nowTs,
-          deviceId: deviceIdRef.current,
-          data: envelope.data,
-        });
-        meshOk = true;
-      }
-    } catch {}
-
-    // Channel 3: Optional Private Cloud DB URL (if configured at top of file or settings)
-    const privateDbUrl = (CLOUD_DB_URL || settings?.cloudSyncUrl || '').trim();
-    if (privateDbUrl && privateDbUrl.startsWith('https://')) {
-      try {
-        setCloudSyncStatus('syncing');
-        const fullSnapshot = {
-          updatedAt: nowTs,
-          deviceId: deviceIdRef.current,
-          ...stateMapRef.current,
-          [key]: cleanValue,
-        };
-        await fetchWithRetry(privateDbUrl, {
-          method: 'PUT',
+      if (ep.type === 'php') {
+        await fetchWithRetry(ep.url, {
+          method: 'POST',
+          keepalive: true,
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(fullSnapshot),
+          body: JSON.stringify({
+            updatedAt: nowTs,
+            deviceId: deviceIdRef.current,
+            updates,
+          }),
         }, 2);
-        pendingDirtyRef.current.delete(key);
-        setCloudSyncStatus('synced');
-        return;
-      } catch {
-        pendingDirtyRef.current.add(key);
-        setCloudSyncStatus('offline');
-        return;
+      } else {
+        const metaObj = {};
+        SYNC_KEYS.forEach((k) => {
+          metaObj[k] = {
+            updatedAt: Number(syncMetaRef.current[k] || nowTs),
+            deviceId: deviceIdRef.current,
+          };
+        });
+        await fetchWithRetry(ep.url, {
+          method: 'PUT',
+          keepalive: true,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            updatedAt: nowTs,
+            deviceId: deviceIdRef.current,
+            _meta: metaObj,
+            ...stateMapRef.current,
+          }),
+        }, 2);
       }
-    }
-
-    if (navigator.onLine === false || !meshOk) {
-      pendingDirtyRef.current.add(key);
-      setCloudSyncStatus(navigator.onLine === false ? 'offline' : 'synced');
-    } else {
-      pendingDirtyRef.current.delete(key);
+      keysToPush.forEach((k) => pendingDirtyRef.current.delete(k));
       setCloudSyncStatus('synced');
+    } catch {
+      keysToPush.forEach((k) => pendingDirtyRef.current.add(k));
+      setCloudSyncStatus('error');
     }
-  }, [settings?.cloudSyncUrl]);
+  }, []);
 
-  // Initialize Automatic Background Sync Channels on Mount (Zero Configuration!)
+  // Initialize Server Auto-Sync & BroadcastChannel on Mount
   useEffect(() => {
     const roomId = getAutoSyncRoomId();
+    serverEndpointRef.current = getServerSyncEndpoint();
 
-    // 1. Seed initial snapshots so mount does not trigger unnecessary pushes
     SYNC_KEYS.forEach((k) => {
       prevSnapshotsRef.current[k] = JSON.stringify(stateMapRef.current[k]);
     });
 
-    // 2. BroadcastChannel for instant sync across browser tabs
     try {
       if (typeof BroadcastChannel !== 'undefined') {
         const bc = new BroadcastChannel(roomId);
@@ -5511,84 +5569,33 @@ function App() {
       }
     } catch {}
 
-    // 3. GunDB Real-Time Cross-Device Mesh (Connects automatically to public relays)
-    try {
-      if (typeof window !== 'undefined' && typeof window.Gun === 'function') {
-        const gun = window.Gun({
-          peers: [
-            'https://gun-manhattan.herokuapp.com/gun',
-            'https://peer.wallie.io/gun',
-            'https://relay.peer.ooo/gun'
-          ],
-          localStorage: false,
-          radisk: false,
-        });
-        const rootNode = gun.get(roomId);
-        gunRootRef.current = rootNode;
+    pullFromServer();
 
-        SYNC_KEYS.forEach((k) => {
-          rootNode.get(k).on((node) => {
-            if (!node || !node.data) return;
-            try {
-              const parsed = JSON.parse(node.data);
-              applyRemoteKeyUpdate(k, parsed, node.updatedAt, node.deviceId);
-            } catch {}
-          });
-        });
-      }
-    } catch {}
-
-    // 4. Optional Private Cloud DB Auto-Pull
-    const pullPrivateDb = async () => {
-      const privateDbUrl = (CLOUD_DB_URL || stateMapRef.current.settings?.cloudSyncUrl || '').trim();
-      if (!privateDbUrl || !privateDbUrl.startsWith('https://')) return;
-      try {
-        const res = await fetchWithRetry(privateDbUrl, { cache: 'no-store' }, 1);
-        const parsed = await res.json();
-        if (parsed && typeof parsed === 'object') {
-          SYNC_KEYS.forEach((k) => {
-            if (parsed[k] !== undefined) {
-              applyRemoteKeyUpdate(k, parsed[k], parsed.updatedAt, parsed.deviceId);
-            }
-          });
-          setCloudSyncStatus('synced');
-        }
-      } catch {
-        setCloudSyncStatus('offline');
-      }
-    };
-    pullPrivateDb();
-
-    // 5. Automatic Offline Retry Queue & Reconnect Flusher (runs every 6s and on online event)
-    const flushPending = () => {
+    const syncCycle = () => {
       if (navigator.onLine === false) {
-        setCloudSyncStatus('offline');
+        if (serverVerifiedRef.current) setCloudSyncStatus('error');
         return;
       }
-      if (pendingDirtyRef.current.size > 0) {
-        const keysToRetry = Array.from(pendingDirtyRef.current);
-        keysToRetry.forEach((k) => {
-          pushKeyToBackground(k, stateMapRef.current[k]);
-        });
-      } else {
-        setCloudSyncStatus('synced');
+      if (pendingDirtyRef.current.size > 0 && serverVerifiedRef.current) {
+        pushKeysToServer(Array.from(pendingDirtyRef.current));
+      } else if (serverEndpointRef.current) {
+        pullFromServer();
       }
-      pullPrivateDb();
     };
 
-    const retryTimer = setInterval(flushPending, 6000);
-    window.addEventListener('online', flushPending);
-    window.addEventListener('focus', flushPending);
+    const timer = setInterval(syncCycle, 6000);
+    window.addEventListener('online', syncCycle);
+    window.addEventListener('focus', syncCycle);
 
     return () => {
-      clearInterval(retryTimer);
-      window.removeEventListener('online', flushPending);
-      window.removeEventListener('focus', flushPending);
+      clearInterval(timer);
+      window.removeEventListener('online', syncCycle);
+      window.removeEventListener('focus', syncCycle);
       try { if (bcRef.current) bcRef.current.close(); } catch {}
     };
-  }, [applyRemoteKeyUpdate, pushKeyToBackground]);
+  }, [applyRemoteKeyUpdate, pullFromServer, pushKeysToServer]);
 
-  // Watch all persisted datasets and auto-sync ONLY the changed key in background
+  // Automatically push any changed data in background
   useEffect(() => {
     if (isApplyingRemoteRef.current) return;
     const changedKeys = [];
@@ -5603,14 +5610,11 @@ function App() {
     });
     if (changedKeys.length === 0) return;
 
-    setCloudSyncStatus('syncing');
     const timer = setTimeout(() => {
-      changedKeys.forEach((k) => {
-        pushKeyToBackground(k, stateMapRef.current[k]);
-      });
-    }, 350);
+      pushKeysToServer(changedKeys);
+    }, 300);
     return () => clearTimeout(timer);
-  }, [settings, roles, users, students, teachers, classes, majors, attendance, permissions, pushKeyToBackground]);
+  }, [settings, roles, users, students, teachers, classes, majors, attendance, permissions, pushKeysToServer]);
 
   const currentUser = useMemo(() => {
     return users.find(u => u.id === currentUserId) || users.find(u => u.role === currentRole) || {
@@ -5943,19 +5947,31 @@ function App() {
 
           <div className="flex items-center gap-2.5">
             <span
-              title="Perubahan data otomatis tersimpan & disinkronkan antar perangkat di latar belakang"
+              title={
+                cloudSyncStatus === 'synced'
+                  ? 'Terhubung ke server database: semua perangkat otomatis sinkron'
+                  : cloudSyncStatus === 'syncing'
+                  ? 'Sedang menyimpan perubahan ke server...'
+                  : 'Upload file sync.php di folder yang sama atau isi CLOUD_DB_URL agar sinkron antar device'
+              }
               className={`hidden sm:inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1 text-[11px] font-bold ${
                 cloudSyncStatus === 'syncing'
                   ? 'border-blue-200 bg-blue-50 text-blue-700'
-                  : cloudSyncStatus === 'offline'
-                  ? 'border-amber-200 bg-amber-50 text-amber-700'
-                  : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                  : cloudSyncStatus === 'synced'
+                  ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                  : 'border-amber-200 bg-amber-50 text-amber-700'
               }`}
             >
               <span className={`h-2 w-2 rounded-full ${
-                cloudSyncStatus === 'syncing' ? 'bg-blue-500 animate-ping' : cloudSyncStatus === 'offline' ? 'bg-amber-500' : 'bg-emerald-500'
+                cloudSyncStatus === 'syncing' ? 'bg-blue-500 animate-ping' : cloudSyncStatus === 'synced' ? 'bg-emerald-500' : 'bg-amber-500'
               }`} />
-              {cloudSyncStatus === 'syncing' ? 'Menyinkronkan...' : cloudSyncStatus === 'offline' ? 'Antrean Offline' : 'Tersinkron Otomatis'}
+              {cloudSyncStatus === 'syncing'
+                ? 'Menyinkronkan...'
+                : cloudSyncStatus === 'synced'
+                ? 'Server Sinkron Aktif'
+                : cloudSyncStatus === 'error'
+                ? 'Menunggu Koneksi...'
+                : 'Mode Lokal (Butuh sync.php)'}
             </span>
             <LiveClockBadge />
 
@@ -6163,6 +6179,7 @@ function App() {
           {activeMenu === "logs" && <ActivityLogsView logs={logs} />}
           {activeMenu === "settings" && (
             <SchoolSettingsView
+              cloudSyncStatus={cloudSyncStatus}
               settings={settings}
               setSettings={setSettings}
               roles={roles}
